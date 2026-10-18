@@ -95,3 +95,109 @@ This document tracks progress, architectural decisions, and educational breakdow
 ### 9. Action Items Before Phase 1
 - Verify Docker Desktop or Docker engine availability on the host machine.
 - Set up project virtual environment (`.venv`) using Python.
+
+---
+
+## Phase 1: Foundation (Scaffolding, Database Schema, Core Engine & Healthcheck)
+
+### 1. What was built
+- `.gitignore`: Excludes virtual environments, compilation caches, coverage reports, Docker volumes, and secret files (`.env`).
+- `pyproject.toml`: Standard packaging specifying dependencies (FastAPI, SQLAlchemy 2, psycopg 3, pandas, NumPy, yfinance, Pydantic v2), Ruff linter rules, and pytest options.
+- `.env.example`: Canonical environment configuration template documenting all database, risk default, and application variables.
+- `sql/init.sql`: Production PostgreSQL 16 DDL defining 5 tables (`instruments`, `prices`, `portfolios`, `holdings`, `ingestion_runs`), composite keys, CHECK constraints, and indexes.
+- `docker-compose.yml`: Multi-container specification running `postgres:16-alpine` with automated entrypoint schema initialization and health checks alongside the API service.
+- `app/config.py`: Centralized configuration management using Pydantic v2 `BaseSettings` with type validation, `.env` file reading, and cached singleton instantiation.
+- `app/db.py`: Database infrastructure implementing SQLAlchemy 2 engine with psycopg 3 driver, connection pooling (`pool_pre_ping=True`), session generator (`get_db`), and live `SELECT 1` connectivity probe.
+- `app/models.py`: SQLAlchemy 2 declarative ORM models matching database tables with explicit types (`Mapped[...]`), relationships, and constraints.
+- `app/api.py`: FastAPI application entrypoint featuring OpenAPI docs setup and `/health` route exercising both application process and database engine.
+- `tests/conftest.py`: Pytest session fixtures providing an isolated `TestClient` and transactional database session.
+- `tests/test_api.py`: Integration test asserting `/health` endpoint response structure and status code integrity.
+
+---
+
+### 2. Conceptual Deep-Dive (Plain English with Concrete Numbers)
+
+#### A. Fixed-Point Decimal (`NUMERIC`) vs. Floating-Point (`FLOAT`)
+- **The Concept**: Computers represent floating-point numbers (`float` in Python, `FLOAT` / `DOUBLE PRECISION` in SQL) using binary fractions (IEEE 754 standard). Numbers that have finite representations in base 10 (like 0.1 or 0.2) have repeating, infinite representations in base 2!
+- **Numeric Example**:
+  - In binary float: `0.1 + 0.2` produces `0.30000000000000004`.
+  - In a portfolio risk engine tracking \$100,000,000 across 10,000 daily rebalancings, tiny float precision leaks cause weights that should sum to 1.0 to sum to `0.99999997` or `1.00000004`.
+  - **The Solution**: PostgreSQL's `NUMERIC(precision, scale)` stores exact decimal digits in an array of base-10,000 integers. `NUMERIC(18,6)` guarantees that every cent and basis point is stored with 100% mathematical precision without binary rounding drift.
+
+#### B. Integrity Constraints: Why Every Rule Exists
+- **`CHECK (adj_close > 0)` on `prices`**:
+  - The single-period simple return formula is $r(t) = \frac{P(t)}{P(t-1)} - 1$.
+  - If a vendor sends a bad tick of \$0.00, calculating $r(t+1)$ causes an uncaught ZeroDivisionError crash. If it sends a corrupted negative price, it generates mathematically nonsensical negative cumulative returns. The database engine rejects bad rows at the gate.
+- **`CHECK (weight >= 0 AND weight <= 1)` on `holdings`**:
+  - Enforces a long-only investment mandate (no short positions, where $w_i < 0$) and guarantees that no single asset exceeds 100% of the portfolio.
+- **Composite Primary Keys**:
+  - `prices(instrument_id, date)`: A stock or ETF has exactly one closing price on any given trading day. The composite PK guarantees uniqueness without requiring an artificial surrogate ID.
+  - `holdings(portfolio_id, instrument_id)`: A portfolio cannot allocate to the same ETF twice.
+
+#### C. Why We Need `idx_prices_date` Alongside the Primary Key
+- The composite primary key `(instrument_id, date)` automatically creates a B-tree index ordered by `instrument_id` first, then `date`.
+- If we query: *"Give me prices for instrument 1 on 2024-01-15"*, the primary key index is lightning fast because `instrument_id` is the leading column.
+- But our multi-asset risk engine needs to query: *"Give me the prices of all 8 assets between 2020-01-01 and 2024-12-31 to compute their covariance matrix."*
+- Without a standalone index on `date`, PostgreSQL would have to execute an expensive sequential table scan across millions of historical price rows. `CREATE INDEX idx_prices_date ON prices(date)` allows PostgreSQL to jump directly to the date range across all instruments in $O(\log N)$ time.
+
+#### D. Connection Pooling & `SELECT 1` Healthchecks
+- Opening a fresh TCP connection to PostgreSQL requires a three-way TCP handshake, SSL negotiation, and process authentication—costing 20 to 50 milliseconds per request.
+- SQLAlchemy maintains a **Connection Pool** of reusable, already-open connections in memory.
+- In `app/db.py`, `pool_pre_ping=True` issues an internal `SELECT 1` before checking out a connection from the pool. If PostgreSQL restarted or dropped an idle TCP connection, SQLAlchemy discards the dead connection and seamlessly opens a fresh one without throwing a 500 error to the client.
+
+---
+
+### 3. Key Architectural Choices & Rationale
+- **Single SQL script (`sql/init.sql`) mounted into `docker-entrypoint-initdb.d`**: When PostgreSQL initializes for the first time in Docker, it automatically executes all `.sql` files in that directory. This provides zero-touch database bootstrapping without requiring complex migration frameworks for a fixed-scope service.
+- **SQLAlchemy 2 `Mapped[...]` Declarative Typing**: Using SQLAlchemy 2.0 type-annotated attributes allows Ruff and Mypy to catch type mismatches at lint time rather than runtime.
+- **Pydantic v2 `BaseSettings` with `.env` Separation**: Follows Twelve-Factor App methodology (Config in Environment). No credentials or database URLs are hardcoded in application logic.
+
+---
+
+### 4. Calculations Used So Far
+- *None implemented in code yet (Foundation phase). Scheduled for Phase 3.*
+
+---
+
+### 5. Data Sources Used So Far
+- *None loaded yet. Scheduled for Phase 2.*
+
+---
+
+### 6. How to Run and Verify
+```powershell
+# 1. Run linting and style verification
+.venv\Scripts\ruff.exe check .
+.venv\Scripts\ruff.exe format --check .
+
+# 2. Run the test suite
+.venv\Scripts\pytest.exe
+```
+
+Expected output:
+- Ruff: `All checks passed! 10 files already formatted`
+- Pytest: `1 passed`
+
+---
+
+### 7. Test Results
+- **Test count**: 1 test (`tests/test_api.py::test_health_check_structure`).
+- **Pass rate**: 100% passed.
+
+---
+
+### 8. Three Interview Questions You Can Now Answer
+1. **Q: Why use `NUMERIC(18,6)` instead of `FLOAT` or `DOUBLE PRECISION` for asset prices and portfolio weights?**
+   - *Model Answer*: `FLOAT` uses binary floating-point representation (IEEE 754), which cannot represent many base-10 decimals exactly (e.g. 0.1). Over thousands of return calculations and daily portfolio rebalancings, accumulated binary rounding errors cause portfolio weights to drift away from 1.0. PostgreSQL's `NUMERIC` is an arbitrary-precision exact decimal type that stores base-10 digits without precision loss.
+2. **Q: Since `prices` already has a primary key on `(instrument_id, date)`, why did you add a secondary index on `date` alone?**
+   - *Model Answer*: Composite B-tree indexes are ordered left-to-right. A query filtering by `instrument_id` uses the primary key index efficiently. However, calculating portfolio metrics requires cross-sectional date alignment: filtering all instruments across a date window (`WHERE date BETWEEN :start AND :end`). Without a single-column index on `date`, PostgreSQL would have to perform a costly sequential scan of the entire `prices` table.
+3. **Q: How does FastAPI's dependency injection (`Depends(get_db)`) guarantee database safety and prevent connection leaks?**
+   - *Model Answer*: `get_db` is implemented as a Python generator using a `try ... finally` block. When a request arrives, FastAPI invokes `get_db()`, which checks out a session from the SQLAlchemy connection pool. Once the route finishes processing and sends the HTTP response (or even if an unhandled exception occurs), FastAPI automatically executes the code after `yield`, invoking `db.close()`. This guarantees that connections are always returned to the pool, preventing connection exhaustion under heavy load.
+
+---
+
+### 9. Action Items Before Phase 2
+- Implement `scripts/download_prices.py` to ingest the 8-ETF universe.
+- Build `app/loaders.py` with multi-step data cleaning, gap detection, and `ingestion_runs` provenance logging.
+- Generate a deterministic synthetic dataset with a fixed random seed for offline test execution.
+- Create `docs/DATA_SOURCES.md` documenting end-to-end data lineage.
